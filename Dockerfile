@@ -1,4 +1,22 @@
-FROM node:18.18-bullseye-slim
+# Stage: monolith-builder
+# Purpose: Uses the Rust image to build monolith
+# Notes:
+#  - Fine to leave extra here, as only the resulting binary is copied out
+FROM docker.io/rust:1.86-bullseye AS monolith-builder
+
+RUN set -eux && cargo install --locked monolith
+
+# Stage: main-app
+# Purpose: Compiles the frontend and
+# Notes:
+#  - Nothing extra should be left here.  All commands should cleanup
+FROM node:20.19.6-bullseye-slim AS main-app
+
+ENV YARN_HTTP_TIMEOUT=10000000
+
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+
+ENV PRISMA_HIDE_UPDATE_MESSAGE=1
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -6,35 +24,47 @@ RUN mkdir /data
 
 WORKDIR /data
 
-COPY ./package.json ./yarn.lock ./playwright.config.ts ./
+RUN corepack enable
 
-RUN --mount=type=cache,sharing=locked,target=/usr/local/share/.cache/yarn yarn install --network-timeout 10000000
+COPY ./.yarnrc.yml ./
 
-RUN apt-get update
+COPY ./apps/web/package.json ./apps/web/playwright.config.ts ./apps/web/
 
-RUN apt-get install -y \
-    build-essential \
-    curl \
-    libssl-dev \
-    pkg-config
+COPY ./apps/worker/package.json ./apps/worker/
 
-RUN apt-get update
+COPY ./packages ./packages
 
-RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+COPY ./yarn.lock ./package.json ./
 
-ENV PATH="/root/.cargo/bin:${PATH}"
+RUN --mount=type=cache,sharing=locked,target=/usr/local/share/.cache/yarn \
+    set -eux && \
+    yarn workspaces focus linkwarden @linkwarden/web @linkwarden/worker && \
+    # Install curl for healthcheck, and ca-certificates to prevent monolith from failing to retrieve resources due to invalid certificates
+    apt-get update && \
+    apt-get install -yqq --no-install-recommends curl ca-certificates && \
+    apt-get autoremove && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN cargo install monolith
+# Copy the compiled monolith binary from the builder stage
+COPY --from=monolith-builder /usr/local/cargo/bin/monolith /usr/local/bin/monolith
 
-RUN npx playwright install-deps && \
+RUN set -eux && \
     apt-get clean && \
     yarn cache clean
 
-RUN yarn playwright install
-
 COPY . .
 
-RUN yarn prisma generate && \
-    yarn build
+RUN yarn prisma:generate && \
+    yarn web:build && \
+    rm -rf apps/web/.next/cache
 
-CMD yarn prisma migrate deploy && yarn start
+HEALTHCHECK --interval=30s \
+            --timeout=5s \
+            --start-period=10s \
+            --retries=3 \
+            CMD [ "/usr/bin/curl", "--silent", "--fail", "http://127.0.0.1:3000/" ]
+
+EXPOSE 3000
+
+CMD ["sh", "-c", "yarn prisma:deploy && yarn concurrently:start"]
